@@ -1,35 +1,40 @@
-/**
- * This Api class lets you define an API endpoint and methods to request
- * data and process it.
- *
- * See the [Backend API Integration](https://docs.infinite.red/ignite-cli/boilerplate/app/services/#backend-api-integration)
- * documentation for more details.
- */
-import { ApiResponse, ApisauceInstance, create } from "apisauce"
+import {
+  ApisauceInstance,
+  create,
+} from "apisauce"
 import Config from "../../config"
-import { GeneralApiProblem, getGeneralApiProblem } from "./apiProblem"
-import type { ApiConfig, ApiFeedResponse } from "./api.types"
-import type { EpisodeSnapshotIn } from "../../models/Episode"
+import { setGenericPassword, getGenericPassword, resetGenericPassword } from 'react-native-keychain'
+const jwtDecode = require('jwt-decode')
 
-/**
- * Configuring the apisauce instance.
- */
+export type ApiConfig = {
+  url: string,
+  timeout: number,
+}
+
 export const DEFAULT_API_CONFIG: ApiConfig = {
   url: Config.API_URL,
   timeout: 10000,
 }
 
-/**
- * Manages all requests to the API. You can use this class to build out
- * various requests that you need to call from your backend API.
- */
-export class Api {
+class ApiError extends Error {
+  status: number
+  errors: any
+
+  constructor(message: string, status: number, errors: any) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.errors = errors
+  }
+}
+
+class Api {
   apisauce: ApisauceInstance
   config: ApiConfig
+  private token = ''
+  private jwtKey = 'jwt'
+  private errorCallbacks: Set<(error: ApiError) => any> = new Set()
 
-  /**
-   * Set up our API instance. Keep this lightweight!
-   */
   constructor(config: ApiConfig = DEFAULT_API_CONFIG) {
     this.config = config
     this.apisauce = create({
@@ -39,42 +44,91 @@ export class Api {
         Accept: "application/json",
       },
     })
+    this.initializeToken()
   }
 
-  /**
-   * Gets a list of recent React Native Radio episodes.
-   */
-  async getEpisodes(): Promise<{ kind: "ok"; episodes: EpisodeSnapshotIn[] } | GeneralApiProblem> {
-    // make the api call
-    const response: ApiResponse<ApiFeedResponse> = await this.apisauce.get(
-      `api.json?rss_url=https%3A%2F%2Ffeeds.simplecast.com%2FhEI_f9Dx`,
-    )
+  private async initializeToken() {
+    const res: any = await getGenericPassword({ service: this.jwtKey })
+    const token = res?.password
+    if (typeof token === 'string') {
+      this.token = token
+    }
+  }
 
-    // the typical ways to die when calling an api
+  async setToken(token: string) {
+    await setGenericPassword(this.jwtKey, token, { service: this.jwtKey })
+    this.token = token
+  }
+
+  async resetToken() {
+    await resetGenericPassword({ service: this.jwtKey })
+    this.token = ''
+  }
+
+  async isUserLoggedIn() {
+    const token = await this.getStoredToken()
+    const currentTime = Math.floor(Date.now() / 1000)
+    return jwtDecode(token).exp > currentTime
+  }
+
+  public getToken() {
+    return this.token
+  }
+
+  private async getStoredToken() {
+    const res = await getGenericPassword({ service: this.jwtKey })
+    if (!res) {
+      return ''
+    }
+    return res.password
+  }
+
+  async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const requestOptions: RequestInit = {
+      mode: 'cors',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.token}`,
+        ...options.headers
+      },
+      ...options
+    }
+
+    const response = await fetch(`${this.config.url}${path}`, requestOptions)
+    const res = await response.json()
     if (!response.ok) {
-      const problem = getGeneralApiProblem(response)
-      if (problem) return problem
+      const error = new ApiError(res.message || response.statusText, response.status, res.errors)
+      this.errorCallbacks.forEach(callback => callback(error))
+      throw error
     }
 
-    // transform the data into the format we are expecting
-    try {
-      const rawData = response.data
+    return res
+  }
 
-      // This is where we transform the data into the shape we expect for our MST model.
-      const episodes: EpisodeSnapshotIn[] =
-        rawData?.items.map((raw) => ({
-          ...raw,
-        })) ?? []
+  get<T>(path: string): Promise<T> {
+    return this.request(path)
+  }
 
-      return { kind: "ok", episodes }
-    } catch (e) {
-      if (__DEV__ && e instanceof Error) {
-        console.error(`Bad data: ${e.message}\n${response.data}`, e.stack)
-      }
-      return { kind: "bad-data" }
-    }
+  put<T>(path: string, body: object): Promise<T> {
+    return this.request(path, { method: 'PUT', body: JSON.stringify(body) })
+  }
+
+  delete<T>(path: string, body: any): Promise<T> {
+    return this.request(path, { method: 'DELETE', body: JSON.stringify(body) })
+  }
+
+  post<T, B>(path: string, body: B): Promise<T> {
+    return this.request(path, {
+      method: 'POST',
+      body: body instanceof FormData ? body : JSON.stringify(body)
+    })
+  }
+
+  onError(cb: (error: ApiError) => any) {
+    this.errorCallbacks.add(cb)
   }
 }
 
 // Singleton instance of the API for convenience
-export const api = new Api()
+export const API = new Api()
